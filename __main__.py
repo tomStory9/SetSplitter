@@ -1,15 +1,8 @@
 import os
 import pandas as pd
-import moviepy as mv
+import ffmpeg
 from datetime import datetime
 from PIL import Image, ImageDraw, ImageFont, ImageOps
-
-
-def timecode_to_seconds(tc):
-    if pd.isna(tc) or not str(tc).strip():
-        return None
-    x = datetime.strptime(str(tc).strip(), "%H:%M:%S")
-    return x.hour * 3600 + x.minute * 60 + x.second
 
 
 def load_character_image(character_name, sprites_dir="thumbnail/sprites"):
@@ -59,6 +52,30 @@ def get_unique_filename(base_path):
         counter += 1
 
 
+def timecode_to_seconds(timecode):
+    """Convertit un timecode (HH:MM:SS) en secondes"""
+    if pd.isna(timecode) or timecode == "":
+        return None
+
+    try:
+        # Support pour différents formats de timecode
+        if isinstance(timecode, str):
+            parts = timecode.split(":")
+            if len(parts) == 3:  # HH:MM:SS
+                hours, minutes, seconds = map(float, parts)
+                return hours * 3600 + minutes * 60 + seconds
+            elif len(parts) == 2:  # MM:SS
+                minutes, seconds = map(float, parts)
+                return minutes * 60 + seconds
+            else:  # Assume it's just seconds
+                return float(timecode)
+        else:
+            return float(timecode)
+    except (ValueError, AttributeError):
+        print(f"⚠️  Format de timecode invalide: {timecode}")
+        return None
+
+
 def create_thumbnail(
     background_path,
     player1_skin,
@@ -98,7 +115,7 @@ def create_thumbnail(
 
     # charger le logo central
     try:
-        center_logo = Image.open("thumbnail/assets/LogoBC/LogoBC8.png")
+        center_logo = Image.open("thumbnail/assets/LogoBC/LogoBC6.png")
     except Exception as e:
         print(f"Erreur lors de l'ouverture du logo: {e}")
         return False
@@ -283,6 +300,119 @@ def create_thumbnail(
     return True
 
 
+def get_video_info(input_video_path):
+    """Obtient les informations de la vidéo avec ffmpeg"""
+    try:
+        probe = ffmpeg.probe(input_video_path)
+        video_stream = next(
+            (stream for stream in probe["streams"] if stream["codec_type"] == "video"),
+            None,
+        )
+        audio_stream = next(
+            (stream for stream in probe["streams"] if stream["codec_type"] == "audio"),
+            None,
+        )
+
+        fps = eval(video_stream["r_frame_rate"]) if video_stream else None
+        has_audio = audio_stream is not None
+        duration = float(probe["format"]["duration"])
+
+        return {"fps": fps, "has_audio": has_audio, "duration": duration}
+    except Exception as e:
+        print(f"❌ Erreur lors de l'obtention des infos vidéo: {e}")
+        return None
+
+
+def extract_clips_ffmpeg(input_video_path, clips_data, temp_dir):
+    """Extrait les clips avec ffmpeg et retourne la liste des fichiers temporaires"""
+    temp_files = []
+
+    for i, (start_sec, end_sec) in enumerate(clips_data):
+        temp_file = os.path.join(temp_dir, f"temp_clip_{i}.mp4")
+
+        try:
+            print(f"⏳ Extraction clip {i+1}: {start_sec}s -> {end_sec}s")
+
+            # Créer le stream d'entrée
+            input_stream = ffmpeg.input(
+                input_video_path, ss=start_sec, t=end_sec - start_sec
+            )
+
+            # Créer le stream de sortie avec les mêmes paramètres que l'original
+            output_stream = ffmpeg.output(
+                input_stream,
+                temp_file,
+                vcodec="libx264",
+                acodec="aac",
+                r=59.75,  # FPS
+                ar=48000,  # Audio sample rate
+                preset="ultrafast",
+                avoid_negative_ts="make_zero",
+            )
+
+            # Exécuter la commande
+            ffmpeg.run(output_stream, overwrite_output=True, quiet=True)
+            temp_files.append(temp_file)
+
+        except Exception as e:
+            print(f"❌ Erreur lors de l'extraction du clip {i+1}: {e}")
+            continue
+
+    return temp_files
+
+
+def concatenate_clips_ffmpeg(temp_files, output_path):
+    """Concatène les clips avec ffmpeg"""
+    if not temp_files:
+        print("❌ Aucun clip à concaténer")
+        return False
+
+    if len(temp_files) == 1:
+        # Si un seul clip, copier directement
+        try:
+            input_stream = ffmpeg.input(temp_files[0])
+            output_stream = ffmpeg.output(
+                input_stream, output_path, vcodec="copy", acodec="copy"
+            )
+            ffmpeg.run(output_stream, overwrite_output=True, quiet=True)
+            return True
+        except Exception as e:
+            print(f"❌ Erreur lors de la copie du clip unique: {e}")
+            return False
+
+    # Créer un fichier de liste pour la concaténation
+    concat_file = "temp_concat_list.txt"
+    try:
+        with open(concat_file, "w") as f:
+            for temp_file in temp_files:
+                f.write(f"file '{os.path.abspath(temp_file)}'\n")
+
+        # Concaténer avec ffmpeg
+        input_stream = ffmpeg.input(concat_file, format="concat", safe=0)
+        output_stream = ffmpeg.output(
+            input_stream,
+            output_path,
+            vcodec="libx264",
+            acodec="aac",
+            r=59.75,
+            ar=48000,
+            preset="ultrafast",
+        )
+
+        ffmpeg.run(output_stream, overwrite_output=True, quiet=True)
+
+        # Nettoyer le fichier de liste
+        os.remove(concat_file)
+        return True
+
+    except Exception as e:
+        print(f"❌ Erreur lors de la concaténation: {e}")
+        # Nettoyer le fichier de liste en cas d'erreur
+        if os.path.exists(concat_file):
+            os.remove(concat_file)
+        return False
+
+
 def generate_thumbnails_only(
     csv_path,
     background_path,
@@ -346,15 +476,32 @@ def process_video(
 ):
     os.makedirs(output_dir, exist_ok=True)
     thumbnail_dir = os.path.join(output_dir, "thumbnails")
+    temp_dir = os.path.join(output_dir, "temp")
     os.makedirs(thumbnail_dir, exist_ok=True)
+    os.makedirs(temp_dir, exist_ok=True)
 
     df = pd.read_csv(csv_path)
 
-    for index, row in df.iterrows():
-        print(row)
-        set_name = row["set_name"]
-        clips = []
+    # Obtenir les informations de la vidéo
+    video_info = get_video_info(input_video_path)
+    if not video_info:
+        print("❌ Impossible d'obtenir les informations de la vidéo")
+        return
 
+    print(f"📹 Vidéo chargée: {input_video_path}")
+    print(f"📊 FPS: {video_info['fps']}")
+    print(f"🎵 Audio: {video_info['has_audio']}")
+    print(f"⏱️  Durée: {video_info['duration']:.2f}s")
+
+    for index, row in df.iterrows():
+        print(f"\n{'='*50}")
+        print(f"🎬 Traitement du set: {row['set_name']}")
+        print(f"{'='*50}")
+
+        set_name = row["set_name"]
+        clips_data = []
+
+        # Générer la thumbnail
         if all(
             field in row
             for field in [
@@ -378,8 +525,9 @@ def process_video(
                     reset_thumbnails,
                 )
             except Exception as e:
-                print(f"Erreur lors de la génération de la thumbnail: {e}")
+                print(f"❌ Erreur lors de la génération de la thumbnail: {e}")
 
+        # Collecter les timecodes valides
         for i in range(1, 6):
             start_tc = row.get(f"start{i}")
             end_tc = row.get(f"end{i}")
@@ -387,37 +535,51 @@ def process_video(
             start_sec = timecode_to_seconds(start_tc)
             end_sec = timecode_to_seconds(end_tc)
 
-            if start_sec is not None and end_sec is not None:
+            if start_sec is not None and end_sec is not None and start_sec < end_sec:
                 print(
-                    f"⏳ Processing set: {set_name}, clip {i}: {start_sec} - {end_sec}"
+                    f"📝 Clip {i} ajouté: {start_tc} -> {end_tc} ({start_sec}s - {end_sec}s)"
                 )
-                clip = mv.VideoFileClip(input_video_path).subclipped(start_sec, end_sec)
-                clips.append(clip)
+                clips_data.append((start_sec, end_sec))
 
-        if clips:
-            final_clip = mv.concatenate_videoclips(clips)
-            output_path = os.path.join(output_dir, f"{set_name}.mp4")
-            print(f"⏳ Exporting set: {set_name}")
-            final_clip.write_videofile(
-                output_path,
-                temp_audiofile="temp-audio.m4a",
-                remove_temp=True,
-                codec="libx264",
-                audio_codec="aac",
-                threads=4,
-                fps=60,
-                preset="slower",
-            )
-            final_clip.close()
-            for c in clips:
-                c.close()
+        if clips_data:
+            # Extraire les clips
+            temp_files = extract_clips_ffmpeg(input_video_path, clips_data, temp_dir)
+
+            if temp_files:
+                # Concaténer les clips
+                output_path = os.path.join(output_dir, f"{set_name}.mp4")
+                print(f"💾 Concaténation vers: {output_path}")
+
+                if concatenate_clips_ffmpeg(temp_files, output_path):
+                    print(f"✅ Export terminé: {set_name}")
+                else:
+                    print(f"❌ Erreur lors de l'export: {set_name}")
+
+                # Nettoyer les fichiers temporaires
+                for temp_file in temp_files:
+                    try:
+                        os.remove(temp_file)
+                    except Exception as e:
+                        print(f"⚠️  Impossible de supprimer {temp_file}: {e}")
+            else:
+                print(f"❌ Aucun clip extrait pour le set: {set_name}")
+        else:
+            print(f"⚠️  Aucun clip valide trouvé pour le set: {set_name}")
+
+    # Nettoyer le dossier temporaire
+    try:
+        os.rmdir(temp_dir)
+    except:
+        pass
+
+    print(f"\n🎉 Traitement terminé!")
 
 
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Découpe une vidéo en sets à partir d'un CSV et génère des thumbnails."
+        description="Découpe une vidéo en sets à partir d'un CSV et génère des thumbnails avec FFmpeg."
     )
     parser.add_argument("csv", help="Chemin vers le fichier .csv")
     parser.add_argument(
