@@ -1,5 +1,5 @@
 <p align="center">
-  <a href="https://github.com/Centre-National-des-arts-du-cirque/IntraCnac" target="_blank">
+  <a href="https://github.com/tomStory9/SetSplitter" target="_blank">
     <img src="public/TBG.png" width="40%" height ="40%" alt="TBG"/>
   </a>
 </p>
