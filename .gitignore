@@ -173,6 +173,9 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
-thumbnail/sprites/*
 
 sets_output/*
+
+main.dist/
+main.build/
+main.onefile-build/
